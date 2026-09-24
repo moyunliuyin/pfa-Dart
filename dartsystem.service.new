@@ -1,0 +1,22 @@
+[Unit]
+Description=DartSystem Service
+After=network.target display-manager.service
+Wants=display-manager.service
+
+[Service]
+Type=simple
+User=dartsystem
+SupplementaryGroups=video render
+WorkingDirectory=/opt/dartsystem
+Environment=PYTHONUNBUFFERED=1
+Environment=QT_QPA_PLATFORM=xcb
+Environment=MVCAM_COMMON_RUNENV=/opt/dartsystem/MvImport_Linux
+Environment=DARTSYSTEM_AUTO_XVFB=1
+ExecStart=/opt/dartsystem/run.sh
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

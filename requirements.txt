@@ -1,0 +1,5 @@
+numpy==1.26.4
+opencv-python==4.10.0.84
+PyQt6==6.8.0
+PyYAML==6.0.1
+crcmod==1.7
