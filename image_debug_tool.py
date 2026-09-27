@@ -1,3 +1,5 @@
+"""离线图片调试工具：复用主检测器并绘制候选目标信息。"""
+
 import argparse
 from pathlib import Path
 
@@ -9,11 +11,14 @@ from opencv_green_detection import detect_green_targets, get_debug_images, set_d
 
 
 class ImageDebugTool:
+    """加载单张图片，输出检测叠加图和掩膜窗口。"""
+
     def __init__(self) -> None:
         self.original_image: np.ndarray | None = None
         self.last_result_image: np.ndarray | None = None
 
     def load_image(self, image_path: str) -> bool:
+        """读取 BGR 图片并保存为后续调试使用的原图。"""
         image = cv2.imread(image_path)
         if image is None:
             print(f"无法读取图片: {image_path}")
@@ -23,6 +28,7 @@ class ImageDebugTool:
         return True
 
     def render_overlays(self, frame_bgr: np.ndarray, targets: list[dict]) -> np.ndarray:
+        """将检测框、轮廓、圆和评分指标叠加到图片副本上。"""
         result = frame_bgr.copy()
         if not targets:
             return result
@@ -56,6 +62,7 @@ class ImageDebugTool:
         return result
 
     def run(self, image_path: str) -> None:
+        """执行单图检测并显示原图、结果图和调试掩膜。"""
         if not self.load_image(image_path):
             return
 

@@ -50,12 +50,12 @@
 
 /* USER CODE BEGIN PRIVATE_TYPES */
 uint8_t count;
-uint8_t sss_buff[32];
+uint8_t sss_buff[32];  /* 预留的 USB CDC 发送/接收临时缓冲区。 */
 Sentry_VisionSendMsg_Usb Sentry_Send_Msg_usb;
 //Sentry_VisionRecvMsg_Usb Sentry_Recv_Msg_usb;
 Vision_Usb Vision_usb;
-Vision_data_rx RV_slove_revice;
-uint8_t temp[60];
+Vision_data_rx RV_slove_revice;  /* 最近一次解析出的机器人状态。 */
+uint8_t temp[60];                /* USB CDC 接收缓冲区。 */
 /* USER CODE END PRIVATE_TYPES */
 
 /**
@@ -267,10 +267,11 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  /* 重新挂接接收缓冲区后立即提交下一次 USB 接收。 */
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &temp[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   
-  // 接收段
+  /* 当前接收解析器使用 A5 帧头，第二字节表示旧协议类型。 */
   if(temp[0] == 0xA5)  // 检查帧头
   {
     switch(temp[1])  // 检查数据类型
@@ -351,6 +352,7 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
 void classdef_SendToPC(Sentry_VisionSendMsg_Usb *pack2vision)
 {
+	/* 默认发送绿色目标标识；具体发送由上层 USB CDC 流程完成。 */
 	pack2vision->Pack.detect_color=2;//
 //	pack2vision->Pack.checksum=
 }

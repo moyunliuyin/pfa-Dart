@@ -15,6 +15,7 @@ SUPPORTED_IMAGE_FORMATS = {"jpg", "jpeg", "png", "bmp"}
 
 
 def _parse_wh(resolution: str | None) -> tuple[int, int] | None:
+    """解析 ``宽x高`` 配置；格式不合法时返回 ``None``。"""
     if resolution is None:
         return None
     s = str(resolution).strip().lower().replace(" ", "")
@@ -65,6 +66,7 @@ class HikFrameRecorder:
             print(f"海康相机录制已开始: {self._game_folder}")
 
     def write_frame_rgb(self, frame_rgb: np.ndarray) -> None:
+        """把 RGB 帧转换为 BGR 后按序号写入本次运行的目录。"""
         if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
             return
 
@@ -74,6 +76,7 @@ class HikFrameRecorder:
         else:
             out_rgb = frame_rgb
 
+        # OpenCV 的 imwrite 接收 BGR；外部检测链路统一使用 RGB。
         bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
 
         self._ensure_game_folder()

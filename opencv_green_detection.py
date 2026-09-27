@@ -1,3 +1,5 @@
+"""基于 HSV、亮度和轮廓几何特征的绿光目标检测。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +13,7 @@ from app_config import DEFAULT_CONFIG
 
 
 def _odd_kernel(value: int, minimum: int = 1) -> int:
+    """把形态学核尺寸规范为不小于最小值的奇数。"""
     value = max(int(value), minimum)
     if value % 2 == 0:
         value += 1
@@ -18,6 +21,7 @@ def _odd_kernel(value: int, minimum: int = 1) -> int:
 
 
 def _optional_float(config: dict[str, Any], *keys: str) -> float | None:
+    """按候选键读取可选浮点配置，兼容新旧字段名。"""
     for key in keys:
         value = config.get(key)
         if value is None:
@@ -31,11 +35,15 @@ def _optional_float(config: dict[str, Any], *keys: str) -> float | None:
 
 @dataclass
 class DetectionResult:
+    """一次检测的结果：是否命中，以及按 near/far 分类后的目标列表。"""
+
     found: bool
     targets: list[dict[str, Any]]
 
 
 class GreenLightDetector:
+    """执行掩膜生成、候选筛选、目标分类和水平角度换算。"""
+
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config: dict[str, Any] = {}
         self.debug_mask: np.ndarray | None = None
@@ -44,20 +52,24 @@ class GreenLightDetector:
         self.set_config(config or DEFAULT_CONFIG.get("detection", {}))
 
     def set_config(self, config: dict[str, Any]) -> None:
+        """替换检测参数；调参窗口通过此入口让下一帧立即生效。"""
         self.config = config or {}
 
     def current_hsv_range(self) -> tuple[np.ndarray, np.ndarray]:
+        """返回 OpenCV ``inRange`` 使用的 HSV 下限和上限。"""
         hsv_config = self.config.get("hsv", {})
         lower = np.array(hsv_config.get("lower", [24, 31, 123]), dtype=np.uint8)
         upper = np.array(hsv_config.get("upper", [83, 253, 255]), dtype=np.uint8)
         return lower, upper
 
     def detect_green_light(self, frame_rgb: np.ndarray) -> DetectionResult:
+        """检测一帧 RGB 图像，严格阈值失败后再用宽松阈值兜底。"""
         lower_hsv, upper_hsv = self.current_hsv_range()
         hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
         value_channel = hsv[:, :, 2]
         stage_reports = []
         for stage_name, relaxed in (("strict", False), ("relaxed", True)):
+            # 宽松阶段只放宽颜色、亮度和形状门槛，不改变目标分类规则。
             mask = self._create_mask(hsv, value_channel, lower_hsv, upper_hsv, relaxed=relaxed)
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             candidates = []
@@ -111,6 +123,7 @@ class GreenLightDetector:
         upper_hsv: np.ndarray,
         relaxed: bool = False,
     ) -> np.ndarray:
+        """把颜色掩膜与亮度掩膜相交，再做模糊和形态学去噪。"""
         if relaxed:
             lower = np.array(
                 [max(int(lower_hsv[0]) - 8, 0), max(int(lower_hsv[1]) - 40, 0), max(int(lower_hsv[2]) - 60, 0)],
@@ -138,6 +151,7 @@ class GreenLightDetector:
         frame_shape: tuple[int, int],
         relaxed: bool = False,
     ) -> list[dict[str, Any]]:
+        """按面积将候选分成近目标/远目标，并为目标补充角度信息。"""
         if not candidates:
             return []
 
@@ -200,6 +214,7 @@ class GreenLightDetector:
         return targets
 
     def _calculate_horizontal_angle(self, x_pixel: int, frame_w: int) -> tuple[float, float]:
+        """把目标横坐标换算为像素偏移和水平角度（单位：度）。"""
         angle_config = self.config.get("angle", {})
         calibration = self.config.get("calibration", {})
 
@@ -232,6 +247,7 @@ class GreenLightDetector:
         return x_offset_px, angle_deg
 
     def _refine_mask(self, mask: np.ndarray) -> np.ndarray:
+        """使用配置的模糊、开闭运算和膨胀/腐蚀改善掩膜连通性。"""
         morphology = self.config.get("morphology", {})
         blur_kernel = _odd_kernel(morphology.get("blur_kernel", 5))
         open_kernel = max(int(morphology.get("open_kernel", 3)), 1)
@@ -252,6 +268,7 @@ class GreenLightDetector:
 
     @staticmethod
     def _contour_geometry(contour: np.ndarray) -> dict[str, Any] | None:
+        """提取轮廓面积、圆度、填充率、包围框和质心等几何特征。"""
         area = float(cv2.contourArea(contour))
         if area <= 0.0:
             return None
@@ -298,6 +315,7 @@ class GreenLightDetector:
         min_area: float,
         relaxed: bool = False,
     ) -> np.ndarray:
+        """从候选轮廓中尝试提取更亮、更圆的核心轮廓，减少光晕干扰。"""
         geometry = self._contour_geometry(contour)
         if geometry is None:
             return contour
@@ -384,6 +402,7 @@ class GreenLightDetector:
         frame_shape: tuple[int, int],
         relaxed: bool = False,
     ) -> dict[str, Any] | None:
+        """按面积、圆度、长宽比、半径、亮度和评分筛选单个候选。"""
         contour_config = self.config.get("contour", {})
         brightness_config = self.config.get("brightness", {})
         circle_config = self.config.get("circle", {})

@@ -1,3 +1,5 @@
+"""DartSystem 主程序：相机取流、绿光检测、调参界面和串口发送。"""
+
 from __future__ import annotations
 
 import atexit
@@ -50,6 +52,7 @@ else:
 
 
 def get_camera_value(cam, param_type="float_value", node_name=""):
+    """读取海康相机节点值；读取失败时返回 ``None``。"""
     if param_type == "float_value":
         st_param = MVCC_FLOATVALUE()  # noqa: F405
         memset(byref(st_param), 0, sizeof(MVCC_FLOATVALUE))  # noqa: F405
@@ -64,6 +67,7 @@ def get_camera_value(cam, param_type="float_value", node_name=""):
 
 
 def set_camera_value(cam, param_type="float_value", node_name="", node_value=0):
+    """写入海康相机的浮点或枚举节点值。"""
     if param_type == "float_value":
         return cam.MV_CC_SetFloatValue(node_name, node_value)
     if param_type == "enum_value":
@@ -72,6 +76,7 @@ def set_camera_value(cam, param_type="float_value", node_name="", node_value=0):
 
 
 def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
+    """计算发送帧使用的 CRC-16/CCITT 校验值。"""
     crc = initial
     for byte in data:
         crc ^= byte << 8
@@ -96,6 +101,8 @@ PIXEL_TYPE_NAMES = {
 
 
 class SerialCommunication(QObject):
+    """基于 Linux termios 的非阻塞串口发送器。"""
+
     connection_status = pyqtSignal(bool)
 
     def __init__(
@@ -121,6 +128,7 @@ class SerialCommunication(QObject):
         self.connect_serial()
 
     def connect_serial(self) -> bool:
+        """打开并配置串口；失败时保留错误信息供界面显示。"""
         if termios is None:
             self.last_error = "当前平台不支持 termios 串口配置。"
             self.connection_status.emit(False)
@@ -146,6 +154,7 @@ class SerialCommunication(QObject):
             return False
 
     def _configure_port(self, fd: int) -> None:
+        """将串口设置为原始模式，并应用串口格式和超时策略。"""
         assert termios is not None
         attrs = termios.tcgetattr(fd)
         attrs[0] = 0
@@ -200,6 +209,7 @@ class SerialCommunication(QObject):
         return self.fd is not None
 
     def send_frame(self, payload: bytes) -> bool:
+        """在超时时间内处理部分写入，确保整帧发送或明确失败。"""
         if self.fd is None:
             return False
 
@@ -236,6 +246,8 @@ class SerialCommunication(QObject):
 
 
 class TuningSlider(QWidget):
+    """把浮点调参范围映射到 Qt 整数滑块，并显示还原后的数值。"""
+
     valueChanged = pyqtSignal(object)
 
     def __init__(
@@ -303,6 +315,8 @@ class TuningSlider(QWidget):
 
 
 class TuningWindow(QMainWindow):
+    """集中承载 HSV、亮度、轮廓和形态学等实时调参控件。"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowFlag(Qt.WindowType.Window, True)
@@ -363,6 +377,8 @@ class TuningWindow(QMainWindow):
 
 
 class MainWindow(QMainWindow):
+    """主窗口及运行时状态机，统一承接相机和视频的检测链路。"""
+
     def __init__(self, config_path):
         super().__init__()
         self.config_path = config_path
@@ -498,6 +514,7 @@ class MainWindow(QMainWindow):
             control.setEnabled(enabled)
 
     def apply_runtime_config(self, config: dict, reconnect_serial: bool = True) -> None:
+        """把配置拆分到各子系统，并同步检测器、串口、窗口和录制状态。"""
         self.config = config
         self.camera_config = config.get("camera", {})
         self.calibration_config = config.get("calibration", {})
@@ -537,6 +554,7 @@ class MainWindow(QMainWindow):
         sync_recording_from_config(self.recording_config, PROJECT_ROOT)
 
     def build_detection_runtime_config(self, detection_config: dict) -> dict:
+        """将顶层标定参数注入检测配置，避免算法读取到过期副本。"""
         runtime_detection_config = copy.deepcopy(detection_config)
         runtime_detection_config.pop("calibration", None)
         runtime_detection_config["calibration"] = copy.deepcopy(self.calibration_config)
@@ -576,6 +594,7 @@ class MainWindow(QMainWindow):
                     self.on_live_tuning_toggled(False)
 
     def startup_by_runtime_mode(self) -> None:
+        """根据 ``runtime.mode`` 选择海康相机模式或测试文件模式。"""
         mode = str(self.runtime_config.get("mode", "hik")).lower()
         if mode == "test":
             self.enable_debug_mode("当前为 test 模式，不初始化相机。")
@@ -637,6 +656,7 @@ class MainWindow(QMainWindow):
             self.apply_tuning_controls_to_detection()
 
     def apply_tuning_controls_to_detection(self) -> None:
+        """读取调参控件并生成检测器当前使用的运行时配置。"""
         h_min = self.tuning_controls["h_min"].value()
         h_max = self.tuning_controls["h_max"].value()
         s_min = self.tuning_controls["s_min"].value()
@@ -746,6 +766,7 @@ class MainWindow(QMainWindow):
             print(f"重载配置失败: {exc}")
 
     def setup_camera(self) -> None:
+        """枚举并启动第一台海康相机，同时准备 SDK 帧缓冲区。"""
         device_list = MV_CC_DEVICE_INFO_LIST()  # noqa: F405
         tlayer_type = MV_GIGE_DEVICE | MV_USB_DEVICE  # noqa: F405
         ret = MvCamera.MV_CC_EnumDevices(tlayer_type, device_list)  # noqa: F405
@@ -906,6 +927,7 @@ class MainWindow(QMainWindow):
         height: int,
         pixel_type: int,
     ) -> np.ndarray | None:
+        """按 SDK 的 PixelType 将原始帧统一转换成 RGB 数组。"""
         mono_size = width * height
         if width <= 0 or height <= 0 or frame_data.size < mono_size:
             return None
@@ -952,6 +974,7 @@ class MainWindow(QMainWindow):
             return cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
 
     def read_frame(self) -> tuple[bool, np.ndarray | None]:
+        """从 SDK 取一帧并转换为检测链路使用的 RGB 图像。"""
         if self.camera is None or self.p_data is None or self.st_frame_info is None:
             return False, None
 
@@ -971,6 +994,7 @@ class MainWindow(QMainWindow):
         return True, image_rgb
 
     def update_camera_frame(self) -> None:
+        """定时器回调：取相机帧、录制原始结果并交给统一处理入口。"""
         if self.is_video_mode:
             return
         if self.camera is None:
@@ -994,6 +1018,7 @@ class MainWindow(QMainWindow):
         self.set_label_image(self.mask_label, np.zeros_like(placeholder))
 
     def process_frame(self, frame_rgb: np.ndarray, source_name: str, fps: float | None = None) -> None:
+        """处理单帧：检测、限频发包、绘制调试信息并刷新界面。"""
         self.processed_frame_count += 1
         targets = detect_green_targets(frame_rgb)
         self.send_detection_result(targets)
@@ -1014,6 +1039,7 @@ class MainWindow(QMainWindow):
         self.maybe_log_detection(targets, source_name)
 
     def send_detection_result(self, targets: list[dict]) -> None:
+        """按帧率和最小间隔限频，将检测结果编码成串口协议帧。"""
         if not self.serial_config.get("enabled", False):
             return
         send_every_n = max(int(self.serial_config.get("send_every_n_frames", 1)), 1)
@@ -1059,6 +1085,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def detection_packet_values(targets: list[dict]) -> list[float]:
+        """按协议固定顺序提取数量、近目标标志/角度和远目标标志/角度。"""
         near_target = MainWindow.target_by_role(targets, "near")
         far_target = MainWindow.target_by_role(targets, "far")
         return [
@@ -1071,6 +1098,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def build_detection_packet(targets: list[dict]) -> bytes:
+        """构造 ``A5 + 长度 + 5 个 float32 + CRC16 + 5A`` 二进制帧。"""
         values = MainWindow.detection_packet_values(targets)
         payload = struct.pack("<5f", *values)
         length = len(payload)
@@ -1215,6 +1243,7 @@ class MainWindow(QMainWindow):
             self.load_video(file_path)
 
     def load_video(self, video_path: str) -> None:
+        """打开视频并切换到视频模式；首帧会立即用于检测和显示。"""
         if self.video_cap is not None:
             self.video_cap.release()
         cap = cv2.VideoCapture(video_path)
@@ -1253,6 +1282,7 @@ class MainWindow(QMainWindow):
         self.video_play_button.setText("暂停视频")
 
     def process_video_frame(self) -> None:
+        """读取视频下一帧；播放到末尾后从第一帧循环。"""
         if not self.is_video_mode or self.video_cap is None:
             return
         success, frame_bgr = self.video_cap.read()
@@ -1297,6 +1327,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def shutdown(self) -> None:
+        """幂等释放定时器、视频、串口、海康设备和录制会话。"""
         if self._shutdown_done:
             return
         self._shutdown_done = True

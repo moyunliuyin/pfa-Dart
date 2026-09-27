@@ -12,7 +12,11 @@
 #define FRAME_TYPE_OFFSET 0x02   /* 偏差值帧类型 */
 
 /* Exported types ------------------------------------------------------------*/
-/* 接收数据包定义 */
+/*
+ * 接收数据包定义。
+ * 该结构对应当前 USB CDC 接收端使用的旧版状态/偏差协议；
+ * Python 端发送的检测帧格式见 main.py 的 build_detection_packet。
+ */
 typedef struct
 {
     uint8_t header;        /* 帧头 */
@@ -27,7 +31,7 @@ typedef struct
     } data;
 } Vision_Frame_t;
 
-/* 机器人信息结构体 */
+/* 机器人信息结构体：既提供按字段访问，也保留原始字节缓冲区。 */
 typedef struct
 {
     union

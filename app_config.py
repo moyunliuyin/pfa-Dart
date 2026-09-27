@@ -1,3 +1,5 @@
+"""DartSystem 的默认配置、配置加载与带注释 YAML 保存逻辑。"""
+
 from __future__ import annotations
 
 import copy
@@ -12,10 +14,12 @@ IS_LINUX = sys.platform.startswith("linux")
 
 
 def mv_sdk_python_path() -> Path:
+    """返回当前平台对应的海康 Python SDK 目录。"""
     return PROJECT_ROOT / ("MvImport" if IS_WINDOWS else "MvImport_Linux")
 
 
 def platform_default_serial_port() -> str:
+    """返回平台默认串口名；实际部署时仍应按设备情况修改配置。"""
     if IS_WINDOWS:
         return "COM1"
     return "/dev/ttyACM0"
@@ -117,6 +121,7 @@ DEFAULT_CONFIG = {
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
+    """递归合并配置，保证用户只覆盖需要调整的字段。"""
     merged = copy.deepcopy(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -127,6 +132,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def load_config(config_path: str | Path | None = None) -> dict:
+    """读取 YAML 配置并与默认值合并，同时兼容旧版 ``can`` 配置。"""
     config_file = Path(config_path) if config_path else PROJECT_ROOT / "config.yaml"
     if not config_file.exists():
         return copy.deepcopy(DEFAULT_CONFIG)
@@ -155,6 +161,7 @@ def load_config(config_path: str | Path | None = None) -> dict:
 
 
 def save_config(config: dict, config_path: str | Path | None = None) -> Path:
+    """将配置写回 YAML，并保留面向调参人员的说明注释。"""
     config_file = Path(config_path) if config_path else PROJECT_ROOT / "config.yaml"
     content = render_config_with_comments(config)
     config_file.write_text(content, encoding="utf-8")
@@ -162,6 +169,7 @@ def save_config(config: dict, config_path: str | Path | None = None) -> Path:
 
 
 def _yaml_scalar(value) -> str:
+    """把 Python 标量转换为本项目 YAML 模板使用的文本表示。"""
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -172,6 +180,7 @@ def _yaml_scalar(value) -> str:
 
 
 def _coerce_int(value, default: int) -> int:
+    """将普通整数或 ``0x`` 形式字符串转换为整数，失败时返回默认值。"""
     if isinstance(value, int):
         return value
     if isinstance(value, str):
@@ -183,6 +192,7 @@ def _coerce_int(value, default: int) -> int:
 
 
 def render_config_with_comments(config: dict) -> str:
+    """按固定章节生成配置文件，便于现场直接阅读和调参。"""
     runtime = config.get("runtime", {})
     ui = config.get("ui", {})
     test = config.get("test", {})

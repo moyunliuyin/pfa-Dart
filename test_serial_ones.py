@@ -1,3 +1,5 @@
+"""串口协议冒烟工具：向下位机发送业务字段均为 1.0 的测试帧。"""
+
 from __future__ import annotations
 
 import argparse

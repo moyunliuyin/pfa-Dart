@@ -1,3 +1,5 @@
+"""海康相机与 PyQt 显示链路的独立测试程序。"""
+
 import sys
 import cv2
 import numpy as np

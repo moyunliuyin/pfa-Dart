@@ -1,3 +1,5 @@
+"""海康相机 SDK 的旧版独立调试封装，提供枚举、取流、回调和资源释放工具。"""
+
 import ctypes
 import os
 import sys
