@@ -1,4 +1,27 @@
-"""DartSystem 主程序：相机取流、绿光检测、调参界面和串口发送。"""
+"""DartSystem 主程序：相机取流、绿光检测、调参界面和串口发送。
+
+第一次阅读这个文件时，可以按下面的顺序理解，不需要先把所有函数都看完：
+
+1. ``main`` 创建 Qt 应用和 ``MainWindow``；
+2. ``MainWindow.__init__`` 创建界面、读取配置、准备串口和定时器；
+3. ``startup_by_runtime_mode`` 决定启动海康相机还是测试模式；
+4. 相机帧由 ``update_camera_frame`` 进入，视频帧由 ``process_video_frame`` 进入，
+   两条路径最后都会汇合到 ``process_frame``；
+5. ``process_frame`` 调用检测器、刷新画面，并按配置调用
+   ``send_detection_result``；
+6. 关闭窗口时由 ``shutdown`` 统一释放视频、串口、相机和录制资源。
+
+这份文件中的图像约定是：进入检测器前统一使用 RGB；OpenCV 读取的视频通常是
+BGR，所以视频路径需要先转换。检测器返回的每个目标至少包含 ``role``、``center``、
+``angle_deg`` 等字段，串口发送层再把这些字段压缩成固定的 25 字节协议帧。
+
+现场排查时可以按现象定位：
+
+* 没有图像：先看 ``setup_camera``、``read_frame`` 和 PixelType 转换；
+* 有图像但没有目标：看 ``process_frame`` 之后的检测器参数和掩膜；
+* 有目标但下位机没收到：看 ``send_detection_result``、串口状态和打印出的帧十六进制；
+* 调参不生效：看实时调参开关、``active_detection_config`` 和配置保存流程。
+"""
 
 # 标准库：配置、信号、串口文件描述符、协议打包和生命周期清理。
 from __future__ import annotations
@@ -77,6 +100,11 @@ def set_camera_value(cam, param_type="float_value", node_name="", node_value=0):
     return -1
 
 
+# ---------------------------------------------------------------------------
+# 串口通信和检测结果协议
+# ---------------------------------------------------------------------------
+
+
 def crc16_ccitt(data: bytes, initial: int = 0xFFFF) -> int:
     """计算发送帧使用的 CRC-16/CCITT 校验值。"""
     crc = initial
@@ -103,7 +131,12 @@ PIXEL_TYPE_NAMES = {
 
 
 class SerialCommunication(QObject):
-    """基于 Linux termios 的非阻塞串口发送器。"""
+    """基于 Linux termios 的非阻塞串口发送器。
+
+    这个类只负责“把已经组好的字节帧写到串口”，不参与目标检测，也不决定
+    发送频率。发送频率由 ``MainWindow.send_detection_result`` 控制，这样串口
+    驱动和上层业务各自只有一个职责，现场更容易判断问题在哪里。
+    """
 
     connection_status = pyqtSignal(bool)
 
@@ -256,6 +289,11 @@ class SerialCommunication(QObject):
             print(f"串口已关闭: {self.port}")
 
 
+# ---------------------------------------------------------------------------
+# Qt 实时调参控件
+# ---------------------------------------------------------------------------
+
+
 class TuningSlider(QWidget):
     """把浮点调参范围映射到 Qt 整数滑块，并显示还原后的数值。"""
 
@@ -331,7 +369,11 @@ class TuningSlider(QWidget):
 
 
 class TuningWindow(QMainWindow):
-    """集中承载 HSV、亮度、轮廓和形态学等实时调参控件。"""
+    """集中承载 HSV、亮度、轮廓和形态学等实时调参控件。
+
+    这个窗口只负责收集用户输入。真正的参数合并、阈值排序和检测器更新，
+    统一在 ``MainWindow.apply_tuning_controls_to_detection`` 中完成。
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -392,8 +434,19 @@ class TuningWindow(QMainWindow):
         return control
 
 
+# ---------------------------------------------------------------------------
+# 主窗口：配置、输入源、检测、显示和退出生命周期
+# ---------------------------------------------------------------------------
+
+
 class MainWindow(QMainWindow):
-    """主窗口及运行时状态机，统一承接相机和视频的检测链路。"""
+    """主窗口及运行时状态机，统一承接相机和视频的检测链路。
+
+    可以把 MainWindow 看成现场运行时的“总调度器”：它不实现具体的绿光算法，
+    而是负责把配置、相机/视频输入、检测器、调参界面和串口输出连接起来。
+    ``is_video_mode``、``live_tuning_enabled`` 和 ``_shutdown_done`` 是最重要的
+    三个状态开关，分别表示当前输入源、参数来源和资源是否已经清理。
+    """
 
     def __init__(self, config_path):
         super().__init__()
@@ -402,32 +455,33 @@ class MainWindow(QMainWindow):
         self.config = load_config(self.config_path)
         self.active_detection_config = {}
 
-        # 海康 SDK 取帧状态。p_data/st_frame_info 在相机初始化成功后才有效。
+        # 海康 SDK 取帧状态。相机初始化成功后才会填充这四个字段；
+        # 相机不可用时它们保持空值，程序仍然可以打开视频做算法调试。
         self.camera = None
         self.data_size = 0
         self.p_data = None
         self.st_frame_info = None
 
-        # 视频和串口是相机检测链路之外的两个可切换输入/输出端。
+        # 视频输入和串口输出的状态。视频与相机互斥，串口则可以独立启用/禁用。
         self.serial_comm: SerialCommunication | None = None
         self.video_cap = None
-        self.video_fps = 0.0
-        self.video_total_frames = 0
-        self.current_frame_idx = 0
-        self.is_video_mode = False
-        self.is_video_playing = False
-        self.debug_mode = False
-        self.prev_frame_time = 0.0
-        self.processed_frame_count = 0
-        self.last_serial_send_ts = 0.0
-        self.last_pixel_type: int | None = None
+        self.video_fps = 0.0  # 视频播放定时器的目标帧率。
+        self.video_total_frames = 0  # 用于设置进度条上限。
+        self.current_frame_idx = 0  # 当前视频帧位置，仅用于跳帧和界面显示。
+        self.is_video_mode = False  # True 时停用相机定时器，输入来自 video_cap。
+        self.is_video_playing = False  # True 时 video_timer 正在持续读取视频。
+        self.debug_mode = False  # 相机不可用或 runtime.mode=test 时的提示状态。
+        self.prev_frame_time = 0.0  # 计算相机 FPS 的上一帧时间戳。
+        self.processed_frame_count = 0  # 统一检测入口处理过的帧数，用于串口抽样。
+        self.last_serial_send_ts = 0.0  # 最近一次成功或尝试发送的时间。
+        self.last_pixel_type: int | None = None  # 最近打印过的 SDK 像素格式。
 
         # 调参状态与关闭保护：关闭保护确保 Qt closeEvent 和 aboutToQuit 不会重复释放资源。
-        self.live_tuning_enabled = False
+        self.live_tuning_enabled = False  # False 时检测器跟随 config.yaml。
         self.tuning_controls: dict[str, object] = {}
         self.tuning_window: TuningWindow | None = None
         self.ui_config: dict[str, object] = {}
-        self._shutdown_done = False
+        self._shutdown_done = False  # 防止多条退出路径重复关闭 SDK 句柄。
 
         # 相机、视频、串口重连分别使用独立定时器，切换输入源时只启停对应定时器。
         self.video_timer = QTimer(self)
@@ -545,7 +599,12 @@ class MainWindow(QMainWindow):
             control.setEnabled(enabled)
 
     def apply_runtime_config(self, config: dict, reconnect_serial: bool = True) -> None:
-        """把配置拆分到各子系统，并同步检测器、串口、窗口和录制状态。"""
+        """把配置拆分到各子系统，并同步检测器、串口、窗口和录制状态。
+
+        ``config.yaml`` 是持久配置，``active_detection_config`` 是当前检测器
+        实际使用的副本。这样实时调参时可以先在内存中试参数，只有点击保存后
+        才会写回文件；重载配置时也不会把顶层 calibration 意外留在旧副本里。
+        """
         self.config = config
         # 下面这些引用对应 config.yaml 的一级章节；检测配置会额外注入标定参数。
         self.camera_config = config.get("camera", {})
@@ -590,7 +649,12 @@ class MainWindow(QMainWindow):
         sync_recording_from_config(self.recording_config, PROJECT_ROOT)
 
     def build_detection_runtime_config(self, detection_config: dict) -> dict:
-        """将顶层标定参数注入检测配置，避免算法读取到过期副本。"""
+        """将顶层标定参数注入检测配置，避免算法读取到过期副本。
+
+        算法模块接收的是一份完整的运行时配置，而配置文件把 calibration
+        单独放在顶层。这里做一次明确的拼接，角度计算就不需要同时依赖两个
+        配置对象，也能避免实时调参覆盖标定数据。
+        """
         runtime_detection_config = copy.deepcopy(detection_config)
         runtime_detection_config.pop("calibration", None)
         runtime_detection_config["calibration"] = copy.deepcopy(self.calibration_config)
@@ -608,7 +672,11 @@ class MainWindow(QMainWindow):
         return "串口: 已禁用"
 
     def apply_ui_window_visibility(self) -> None:
-        """应用窗口开关；两个窗口都被关闭时保留主窗口避免程序无界面运行。"""
+        """应用窗口开关；两个窗口都被关闭时保留主窗口避免程序无界面运行。
+
+        如果调参窗口被配置关闭，实时调参开关也会被自动关闭，检测器随即
+        回到配置文件参数，避免“窗口看不见但参数仍在偷偷变化”的情况。
+        """
         display_enabled = bool(self.ui_config.get("enable_display_window", True))
         tuning_enabled = bool(self.ui_config.get("enable_tuning_window", True))
 
@@ -633,7 +701,11 @@ class MainWindow(QMainWindow):
                     self.on_live_tuning_toggled(False)
 
     def startup_by_runtime_mode(self) -> None:
-        """根据 ``runtime.mode`` 选择海康相机模式或测试文件模式。"""
+        """根据 ``runtime.mode`` 选择海康相机模式或测试文件模式。
+
+        ``test`` 模式故意不初始化海康 SDK，因此没有相机也能调试检测算法；
+        ``test.auto_start`` 决定是否继续加载 test.source/test.path 指定的文件。
+        """
         mode = str(self.runtime_config.get("mode", "hik")).lower()
         if mode == "test":
             self.enable_debug_mode("当前为 test 模式，不初始化相机。")
@@ -643,7 +715,12 @@ class MainWindow(QMainWindow):
         self.setup_camera()
 
     def sync_tuning_controls_from_config(self) -> None:
-        """把配置值写入调参控件，且屏蔽信号避免初始化过程触发重复更新。"""
+        """把配置值写入调参控件，且屏蔽信号避免初始化过程触发重复更新。
+
+        这里是“配置文件 → 界面”的单向同步；用户拖动滑块后的反向同步
+        由 ``on_tuning_value_changed`` 和 ``apply_tuning_controls_to_detection``
+        完成。两个方向分开可以避免初始化时产生递归信号。
+        """
         hsv = self.detection_config.get("hsv", {})
         brightness = self.detection_config.get("brightness", {})
         contour = self.detection_config.get("contour", {})
@@ -679,7 +756,11 @@ class MainWindow(QMainWindow):
             control.blockSignals(False)
 
     def on_live_tuning_toggled(self, checked: bool) -> None:
-        """切换实时调参：开启时控件立即生效，关闭时恢复配置文件参数。"""
+        """切换实时调参：开启时控件立即生效，关闭时恢复配置文件参数。
+
+        实时调参适合现场找阈值，不等于自动保存；保存动作必须由用户单独
+        点击按钮确认，这样临时试出的参数不会意外覆盖稳定配置。
+        """
         self.live_tuning_enabled = checked
         self.set_tuning_controls_enabled(checked)
         self.save_tuning_button.setEnabled(checked)
@@ -698,7 +779,12 @@ class MainWindow(QMainWindow):
             self.apply_tuning_controls_to_detection()
 
     def apply_tuning_controls_to_detection(self) -> None:
-        """读取调参控件并生成检测器当前使用的运行时配置。"""
+        """读取调参控件并生成检测器当前使用的运行时配置。
+
+        函数保留配置文件中没有放到界面的字段，只覆盖当前页面暴露的 HSV、
+        亮度、形态学、轮廓和圆半径参数。每次更新都会重新调用
+        ``set_detection_config``，因此下一帧即可看到效果。
+        """
         h_min = self.tuning_controls["h_min"].value()
         h_max = self.tuning_controls["h_max"].value()
         s_min = self.tuning_controls["s_min"].value()
@@ -817,12 +903,18 @@ class MainWindow(QMainWindow):
             print(f"重载配置失败: {exc}")
 
     def setup_camera(self) -> None:
-        """枚举并启动第一台海康相机，同时准备 SDK 帧缓冲区。"""
+        """枚举并启动第一台海康相机，同时准备 SDK 帧缓冲区。
+
+        这里采用“初始化失败就进入调试模式”的策略，而不是让整个 GUI 崩溃。
+        现场没有接相机时仍然可以点击“打开视频”验证检测和串口协议；相机恢复
+        后再重新启动程序即可回到实时模式。
+        """
         # 这里只选择第一台 GigE/USB 海康设备；现场多相机选择逻辑仍由设备顺序决定。
         device_list = MV_CC_DEVICE_INFO_LIST()  # noqa: F405
         tlayer_type = MV_GIGE_DEVICE | MV_USB_DEVICE  # noqa: F405
         ret = MvCamera.MV_CC_EnumDevices(tlayer_type, device_list)  # noqa: F405
         if ret != 0 or device_list.nDeviceNum == 0:
+            # 枚举失败通常是 SDK、驱动或网线问题；这里不继续访问空设备列表。
             self.camera = None
             self.enable_debug_mode("未找到海康相机，已进入视频调试模式。")
             return
@@ -831,10 +923,12 @@ class MainWindow(QMainWindow):
         self.camera = MvCamera()  # noqa: F405
         device = cast(device_list.pDeviceInfo[0], POINTER(MV_CC_DEVICE_INFO)).contents  # noqa: F405
         if self.camera.MV_CC_CreateHandle(device) != 0:
+            # 句柄失败说明 SDK 没有建立到设备的控制通道。
             self.camera = None
             self.enable_debug_mode("创建相机句柄失败。")
             return
         if self.camera.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0) != 0:  # noqa: F405
+            # 独占打开失败时，设备可能正被其他程序占用。
             self.camera = None
             self.enable_debug_mode("打开相机失败。")
             return
@@ -842,6 +936,7 @@ class MainWindow(QMainWindow):
         # 曝光和增益必须在开始取流前设置，避免首帧使用未配置的相机参数。
         self.apply_camera_parameters()
         if self.camera.MV_CC_StartGrabbing() != 0:
+            # 设备已打开但不能取流，通常需要检查采集触发模式或相机状态。
             self.camera = None
             self.enable_debug_mode("启动相机取流失败。")
             return
@@ -850,6 +945,7 @@ class MainWindow(QMainWindow):
         st_param = MVCC_INTVALUE_EX()  # noqa: F405
         memset(byref(st_param), 0, sizeof(MVCC_INTVALUE_EX))  # noqa: F405
         if self.camera.MV_CC_GetIntValueEx("PayloadSize", st_param) != 0:
+            # 没有 PayloadSize 就无法安全分配 SDK 输出缓冲区，因此停止当前初始化。
             self.camera = None
             self.enable_debug_mode("读取 PayloadSize 失败。")
             return
@@ -863,7 +959,11 @@ class MainWindow(QMainWindow):
         print("相机初始化完成")
 
     def apply_camera_parameters(self) -> None:
-        """将配置中的曝光和增益写入相机，并回读实际生效值显示给用户。"""
+        """将配置中的曝光和增益写入相机，并回读实际生效值显示给用户。
+
+        相机可能会把请求值夹在自己的最小/最大范围内，所以界面显示回读值，
+        不直接假设写入值一定生效。
+        """
         if self.camera is None:
             return
         exposure = float(self.camera_config.get("exposure", 16000.0))
@@ -886,13 +986,21 @@ class MainWindow(QMainWindow):
         self.camera_status_label.setText(f"相机: PixelType={pixel_type_name} ({pixel_type})")
 
     def enable_debug_mode(self, reason: str) -> None:
-        """标记相机不可用；视频/图片模式仍可继续复用检测链路。"""
+        """标记相机不可用；视频/图片模式仍可继续复用检测链路。
+
+        调试模式并不会替代相机，只是把“没有相机”变成可见的状态，并让用户
+        知道可以用测试文件继续工作。
+        """
         self.debug_mode = True
         self.camera_status_label.setText(f"相机: 调试模式  {reason}")
         print(reason)
 
     def load_test_source_from_config(self) -> None:
-        """解析 test.source/test.path，并根据类型加载视频或静态图片。"""
+        """解析 test.source/test.path，并根据类型加载视频或静态图片。
+
+        相对路径以项目根目录为基准，绝对路径原样使用。这样配置文件可以
+        在项目内写 ``test.mp4``，也可以直接指向现场采集盘上的文件。
+        """
         source = str(self.test_config.get("source", "video")).lower()
         path_value = str(self.test_config.get("path", "")).strip()
         if not path_value:
@@ -915,7 +1023,10 @@ class MainWindow(QMainWindow):
             self.runtime_hint_label.setText(f"提示: 不支持的 test.source: {source}")
 
     def load_image_test(self, image_path: str) -> None:
-        """加载单张 BGR 图片，转换为 RGB 后执行一次检测。"""
+        """加载单张 BGR 图片，转换为 RGB 后执行一次检测。
+
+        静态图片不会启动 video_timer 或 frame_timer，适合逐张检查阈值和角度。
+        """
         frame_bgr = cv2.imread(image_path)
         if frame_bgr is None:
             print(f"无法读取测试图片: {image_path}")
@@ -930,7 +1041,11 @@ class MainWindow(QMainWindow):
         self.runtime_hint_label.setText(f"提示: 已加载测试图片 {Path(image_path).name}")
 
     def setup_serial(self) -> None:
-        """根据当前串口配置创建连接；失败时保留状态并等待定时器重试。"""
+        """根据当前串口配置创建连接；失败时保留状态并等待定时器重试。
+
+        不要在这里组装检测数据。这个函数只解决“能不能打开哪一个串口”，
+        发送什么内容由 ``send_detection_result`` 和协议函数负责。
+        """
         self._close_serial()
         if not self.serial_config.get("enabled", False):
             self.connection_status_label.setText("串口: 已禁用")
@@ -971,7 +1086,10 @@ class MainWindow(QMainWindow):
             self.serial_comm = None
 
     def refresh_connection(self) -> None:
-        """串口重连定时器和“重连串口”按钮共用的入口。"""
+        """串口重连定时器和“重连串口”按钮共用的入口。
+
+        已连接时不重复打开设备；只有未连接且配置允许发送时才真正尝试重连。
+        """
         if not self.serial_config.get("enabled", False):
             self.connection_status_label.setText("串口: 已禁用")
             return
@@ -991,7 +1109,11 @@ class MainWindow(QMainWindow):
         height: int,
         pixel_type: int,
     ) -> np.ndarray | None:
-        """按 SDK 的 PixelType 将原始帧统一转换成 RGB 数组。"""
+        """按 SDK 的 PixelType 将原始帧统一转换成 RGB 数组。
+
+        不同相机可能输出 Mono8、Bayer、RGB、BGR 或 YUV422。检测器不需要知道
+        相机原始格式，所以所有分支最终都必须返回 ``height x width x 3`` 的 RGB。
+        """
         mono_size = width * height
         if width <= 0 or height <= 0 or frame_data.size < mono_size:
             return None
@@ -1040,7 +1162,11 @@ class MainWindow(QMainWindow):
             return cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
 
     def read_frame(self) -> tuple[bool, np.ndarray | None]:
-        """从 SDK 取一帧并转换为检测链路使用的 RGB 图像。"""
+        """从 SDK 取一帧并转换为检测链路使用的 RGB 图像。
+
+        返回 ``(False, None)`` 时代表这一次取帧失败，调用方保留上一帧界面，
+        不会把不完整的缓冲区交给检测器。
+        """
         if self.camera is None or self.p_data is None or self.st_frame_info is None:
             return False, None
 
@@ -1062,7 +1188,11 @@ class MainWindow(QMainWindow):
         return True, image_rgb
 
     def update_camera_frame(self) -> None:
-        """定时器回调：取相机帧、录制原始结果并交给统一处理入口。"""
+        """定时器回调：取相机帧、录制原始结果并交给统一处理入口。
+
+        ``frame_timer`` 默认约每 30ms 调用一次；这里不直接写检测细节，
+        只做输入源相关工作，真正的检测和显示统一交给 ``process_frame``。
+        """
         if self.is_video_mode:
             return
         if self.camera is None:
@@ -1088,7 +1218,16 @@ class MainWindow(QMainWindow):
         self.set_label_image(self.mask_label, np.zeros_like(placeholder))
 
     def process_frame(self, frame_rgb: np.ndarray, source_name: str, fps: float | None = None) -> None:
-        """处理单帧：检测、限频发包、绘制调试信息并刷新界面。"""
+        """处理单帧：检测、限频发包、绘制调试信息并刷新界面。
+
+        这是整个程序最值得优先阅读的函数。它规定了一帧图像的完整生命线：
+
+        ``RGB 图像 → detect_green_targets → targets → 串口协议``
+        ``                                      ↘ 叠加图/掩膜/状态栏``
+
+        因此新增相机、视频或图片输入时，应该尽量让它们最终调用这里，避免
+        出现“画面能显示但不发串口”或“相机能检测但视频模式行为不同”的分叉。
+        """
         self.processed_frame_count += 1
         # 相机帧和视频帧都必须从这里进入，确保检测、显示、日志和串口行为一致。
         targets = detect_green_targets(frame_rgb)
@@ -1103,6 +1242,7 @@ class MainWindow(QMainWindow):
         )
         mask_image, _ = get_debug_images()
 
+        # 检测器可能在首帧失败前还没有掩膜，此时用黑图占位，保持 Qt 尺寸稳定。
         mask_vis = np.zeros_like(frame_rgb) if mask_image is None else cv2.cvtColor(mask_image, cv2.COLOR_GRAY2RGB)
         self.set_label_image(self.camera_label, result_image)
         self.set_label_image(self.mask_label, mask_vis)
@@ -1110,7 +1250,12 @@ class MainWindow(QMainWindow):
         self.maybe_log_detection(targets, source_name)
 
     def send_detection_result(self, targets: list[dict]) -> None:
-        """按帧率和最小间隔限频，将检测结果编码成串口协议帧。"""
+        """按帧率和最小间隔限频，将检测结果编码成串口协议帧。
+
+        发送策略可以用一句话概括：先确认启用，再按帧数和时间限流，最后检查
+        连接状态。未连接时不会静默丢数据，而是打印出“本来要发送什么”，方便
+        在没有下位机或串口权限时也能核对算法输出。
+        """
         if not self.serial_config.get("enabled", False):
             return
 
@@ -1161,7 +1306,12 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def detection_packet_values(targets: list[dict]) -> list[float]:
-        """按协议固定顺序提取数量、近目标标志/角度和远目标标志/角度。"""
+        """按协议固定顺序提取五个业务值。
+
+        顺序必须和下位机解析约定保持一致：目标数量、近目标存在标志、近目标
+        水平角度、远目标存在标志、远目标水平角度。没有对应目标时，标志为 0，
+        角度填 0，避免下位机收到未定义的浮点数。
+        """
         near_target = MainWindow.target_by_role(targets, "near")
         far_target = MainWindow.target_by_role(targets, "far")
         return [
@@ -1174,7 +1324,11 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def build_detection_packet(targets: list[dict]) -> bytes:
-        """构造 ``A5 + 长度 + 5 个 float32 + CRC16 + 5A`` 二进制帧。"""
+        """构造 ``A5 + 长度 + 5 个 float32 + CRC16 + 5A`` 二进制帧。
+
+        帧头和帧尾用于找边界，长度用于确认 payload 大小，CRC 用于发现串口
+        传输中的内容损坏。这里输出的是原始二进制，不是带空格或换行的十六进制文本。
+        """
         values = MainWindow.detection_packet_values(targets)
         # 使用小端序固定协议字段，payload 长度当前为 5 * 4 = 20 字节。
         payload = struct.pack("<5f", *values)
@@ -1193,7 +1347,11 @@ class MainWindow(QMainWindow):
         return next((target for target in targets if target.get("role") == role), None)
 
     def draw_detection_overlay(self, image_rgb, source_name, fps, targets):
-        """在原图上绘制中心线、目标框、连线、角度和评分信息。"""
+        """在原图上绘制中心线、目标框、连线、角度和评分信息。
+
+        这部分只生成“给人看的副本”，不会修改检测器输入，也不会改变串口
+        发送值。画面上的 ``dx`` 是像素偏移，``angle`` 是根据标定结果换算的角度。
+        """
         result = image_rgb.copy()
         height, width = result.shape[:2]
         center = (width // 2, height // 2)
@@ -1269,7 +1427,11 @@ class MainWindow(QMainWindow):
         return result
 
     def update_detection_status(self, targets, source_name) -> None:
-        """更新底部文本状态；存在近目标时优先显示近目标角度。"""
+        """更新底部文本状态；存在近目标时优先显示近目标角度。
+
+        近目标和远目标都命中时，两者都会显示；只有一个目标时，状态栏仍会
+        优先尝试显示 near，再退回显示结果列表中的第一个目标。
+        """
         if targets:
             near_target = self.target_by_role(targets, "near") or targets[0]
             near_angle = float(near_target.get("angle_deg", 0.0))
@@ -1303,7 +1465,11 @@ class MainWindow(QMainWindow):
             print(f"[{source_name}] 未检测到满足阈值的绿光目标")
 
     def set_label_image(self, label: QLabel, image_rgb: np.ndarray) -> None:
-        """将 RGB NumPy 图像包装为 Qt 图片并按 QLabel 比例缩放显示。"""
+        """将 RGB NumPy 图像包装为 Qt 图片并按 QLabel 比例缩放显示。
+
+        ``QImage`` 在这里只是借用 NumPy 缓冲区创建显示对象；调用方保留数组
+        的生命周期，Qt 负责把缩放后的 pixmap 放到对应标签中。
+        """
         # contiguous 保证 QImage 读取到连续内存；这里不改变原始检测帧。
         rgb_image = np.ascontiguousarray(image_rgb)
         height, width, channels = rgb_image.shape
@@ -1318,7 +1484,11 @@ class MainWindow(QMainWindow):
         )
 
     def open_video_file(self) -> None:
-        """打开文件选择框，选择成功后交给 load_video 初始化视频状态。"""
+        """打开文件选择框，选择成功后交给 load_video 初始化视频状态。
+
+        文件选择框只负责拿到路径，视频句柄、FPS、进度条和定时器的状态变化
+        集中放在 ``load_video``，以后从配置自动加载视频也可以复用同一入口。
+        """
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择视频文件",
@@ -1329,7 +1499,11 @@ class MainWindow(QMainWindow):
             self.load_video(file_path)
 
     def load_video(self, video_path: str) -> None:
-        """打开视频并切换到视频模式；首帧会立即用于检测和显示。"""
+        """打开视频并切换到视频模式；首帧会立即用于检测和显示。
+
+        加载视频会释放旧视频、停止相机定时器、重置进度条，但不会销毁海康
+        相机句柄；这样点击“回到相机”时可以直接恢复相机定时器。
+        """
         if self.video_cap is not None:
             self.video_cap.release()
         cap = cv2.VideoCapture(video_path)
@@ -1355,7 +1529,11 @@ class MainWindow(QMainWindow):
         self.process_video_frame()
 
     def toggle_video_playback(self) -> None:
-        """启动或暂停视频定时器；播放间隔由视频 FPS 换算得到。"""
+        """启动或暂停视频定时器；播放间隔由视频 FPS 换算得到。
+
+        这里的“播放”本质上是周期性调用 ``process_video_frame``，并不是另起
+        一个线程，因此所有 UI 更新仍发生在 Qt 主线程中。
+        """
         if not self.is_video_mode or self.video_cap is None:
             return
         if self.is_video_playing:
@@ -1369,7 +1547,11 @@ class MainWindow(QMainWindow):
         self.video_play_button.setText("暂停视频")
 
     def process_video_frame(self) -> None:
-        """读取视频下一帧；播放到末尾后从第一帧循环。"""
+        """读取视频下一帧；播放到末尾后从第一帧循环。
+
+        OpenCV 返回 BGR，转换成 RGB 后调用与相机完全相同的 ``process_frame``。
+        拖动进度条也会走这里，所以“手动查看某帧”和“连续播放”使用同一套检测逻辑。
+        """
         if not self.is_video_mode or self.video_cap is None:
             return
         success, frame_bgr = self.video_cap.read()
@@ -1397,7 +1579,11 @@ class MainWindow(QMainWindow):
         self.process_video_frame()
 
     def switch_to_camera_mode(self) -> None:
-        """释放视频句柄并恢复相机定时器。"""
+        """释放视频句柄并恢复相机定时器。
+
+        如果相机初始化失败，恢复后仍会显示调试占位图；这个按钮不会偷偷
+        重新初始化相机，重新枚举设备请重启程序。
+        """
         if self.video_timer.isActive():
             self.video_timer.stop()
         self.is_video_playing = False
@@ -1417,7 +1603,12 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def shutdown(self) -> None:
-        """幂等释放定时器、视频、串口、海康设备和录制会话。"""
+        """幂等释放定时器、视频、串口、海康设备和录制会话。
+
+        退出顺序很重要：先停止会继续触发回调的定时器，再释放视频/串口，
+        最后停止海康取流和录制器。``_shutdown_done`` 让 closeEvent、Qt 的
+        aboutToQuit 和 KeyboardInterrupt 可以安全地重复调用这个函数。
+        """
         if self._shutdown_done:
             return
         self._shutdown_done = True
@@ -1442,7 +1633,12 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
-    """创建 Qt 应用，按配置启动主窗口，并统一处理退出清理。"""
+    """创建 Qt 应用，按配置启动主窗口，并统一处理退出清理。
+
+    正常启动路径是：读取 ``config.yaml`` → 创建 QApplication → 创建窗口 →
+    根据 ``runtime.mode`` 初始化相机或测试源 → 进入 Qt 事件循环。程序不在
+    ``main`` 中手动循环取帧，取帧和重绘由 Qt 定时器驱动。
+    """
     config_path = PROJECT_ROOT / "config.yaml"
     _ = load_config(config_path)
 
