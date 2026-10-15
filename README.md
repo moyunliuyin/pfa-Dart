@@ -130,6 +130,24 @@ serial:
 - `min_send_interval_ms`：两次发送之间的最小间隔（毫秒）
 - `send_every_n_frames`：每几帧发送一次
 
+## 检测数据模拟
+
+`simulate_dart.py` 用与主程序相同的 25 字节协议，模拟“绿光检测结果发送给下位机”。
+默认只打印帧，不打开串口：
+
+```bash
+python simulate_dart.py --near-angle 2.5 --far-angle -1.2
+```
+
+指定串口后才会实际发送到该串口连接的下位机（Linux 下通常是 `/dev/ttyACM0`）：
+
+```bash
+python simulate_dart.py --port /dev/ttyACM0 --near-angle 2.5 --count 0
+```
+
+未指定 `--near-angle` 或 `--far-angle` 时，对应目标标志为 0、角度为 0。发送帧中的 5 个字段顺序为：
+`target_count`、`near_flag`、`near_angle_deg`、`far_flag`、`far_angle_deg`。
+
 ## 发送内容
 
 发送给下位机的应用层数据先构造成 25 字节协议帧，只包含水平转角：

@@ -9,6 +9,7 @@ DartSystem
 .idea
 log
 __pycache__
+.uv-cache/
 LICENSE
 heatmap
 .venv
